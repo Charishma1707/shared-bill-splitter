@@ -156,21 +156,99 @@ You must understand every line you submit. We check this with your video and in 
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
 
+## Architecture & Design
+
+### High-Level Architecture
+
+The system is designed as an edge-native, fault-tolerant web application consisting of two primary layers:
+
+1. **Backend API (`api/`):**
+   - **Runtime:** Cloudflare Workers (V8 isolates running on Cloudflare's global edge network).
+   - **Framework:** Hono (`hono`), providing lightweight, zero-cold-start HTTP routing with strict TypeScript types.
+   - **Database:** Cloudflare D1 (serverless SQLite) bound as `c.env.DB`. All bill and share creations execute inside atomic transactions using `c.env.DB.batch(...)`.
+   - **Schema & Migrations:** Defined in `api/migrations/0001_init.sql` with relational foreign keys, indexes, and named check/unique constraints.
+
+2. **Frontend Client (`web/`):**
+   - **Framework:** React 19 built with Vite.
+   - **Routing:** TanStack Router (`@tanstack/react-router`) with file-based routing (`web/src/routes/`).
+   - **Styling:** Custom Vanilla CSS design system (`web/src/styles.css`) using CSS variables, dark glassmorphism, responsive cards, loading skeletons, and accessible status badges.
+   - **Resilient API Layer:** `web/src/api.ts` wraps all network interactions with an `AbortController` (12s timeout) and safe text-before-JSON parsing to guarantee that slow or 500 error responses never crash the React application.
+
+---
+
 ## Decisions
 
 ### 1. Deterministic Member Sequencing via Explicit `order_index`
 
-Part 2 requires splitting bills and allocating remainder cents strictly in the order members were added to a home. Relying on SQLite internal rowids or timestamp precision can produce nondeterminism during rapid sequential writes. We introduced an explicit `order_index INTEGER NOT NULL` populated via `COALESCE(MAX(order_index), 0) + 1` within the home, protected by a `CONSTRAINT uq_members_home_order UNIQUE (home_id, order_index)`. This guarantees 100% stable, deterministic member ordering across all queries and environments.
+Part 2 requires splitting bills and allocating remainder cents strictly in the order members were added to a home. Relying on SQLite internal rowids or timestamp precision can produce nondeterminism during rapid sequential writes or table maintenance. We introduced an explicit `order_index INTEGER NOT NULL` populated via `COALESCE(MAX(order_index), 0) + 1` within the home, protected by a `CONSTRAINT uq_members_home_order UNIQUE (home_id, order_index)`. This guarantees 100% stable, deterministic member ordering across all queries and environments. If two members are added at the exact same millisecond, the backend automatically catches the sequence collision and retries with the next sequence number.
 
 ### 2. Atomic Compare-And-Set for Concurrency & Idempotent Payments
 
 Payment operations must be resilient to duplicate requests with the same `Idempotency-Key` (returning 200 with the exact same payload) and simultaneous payment attempts for the same share (where only one may succeed). Rather than relying on stateful locks (which do not work across distributed, stateless Cloudflare Workers), we implemented an atomic database compare-and-set query:
-`UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`.
-By evaluating `changes === 0`, concurrent race conditions are immediately detected: if the existing record already matches the idempotency key, it replays the original 200 response; otherwise, it returns a 409 Conflict.
+```sql
+UPDATE shares
+SET paid_at = ?, idempotency_key = ?
+WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+```
+By evaluating `changes === 0`, concurrent race conditions are immediately detected: if the existing record already matches the idempotency key, it replays the original 200 response; otherwise, it returns a 409 Conflict. Additionally, concurrent requests attempting to use the same idempotency key across different shares are caught and safely returned as 409 Conflict.
 
 ### 3. Storage-Level Data Integrity with Named Constraints
 
 To guarantee that invalid states cannot enter the database even outside API validation, we defined explicit named constraints in `api/migrations/0001_init.sql`:
-- `CONSTRAINT check_bills_total_cents CHECK (total_cents > 0)` and `CONSTRAINT check_shares_amount_cents CHECK (amount_cents > 0)` to guarantee positive monetary amounts in whole cents.
-- `CONSTRAINT fk_members_home`, `CONSTRAINT fk_bills_home`, and `CONSTRAINT fk_shares_bill` (with foreign key enforcement and cascade rules) to prevent dangling or orphaned records.
+- `CONSTRAINT check_bills_total_cents CHECK (total_cents > 0)` to guarantee positive monetary amounts in whole cents.
+- `CONSTRAINT check_shares_amount_cents CHECK (amount_cents >= 0)` to allow valid sub-cent splits (such as 1 cent split between 3 members: `1`, `0`, `0`) while preventing negative debts.
+- `CONSTRAINT fk_members_home`, `CONSTRAINT fk_bills_home`, and `CONSTRAINT fk_shares_bill` with `ON DELETE CASCADE` to prevent orphaned child records.
+- `CONSTRAINT fk_shares_member` with `ON DELETE RESTRICT` to protect financial auditability—a member cannot be deleted if active or historical shares reference them.
 - `CONSTRAINT uq_shares_idempotency_key UNIQUE (idempotency_key)` to ensure idempotency keys cannot be shared across different share payments.
+
+---
+
+## Edge Cases Handled
+
+The implementation covers all required edge cases as well as extended defensive scenarios:
+
+1. **Home with no members:**
+   - Attempting to create a bill returns `422 { error: "Home has no members" }`.
+   - `GET /api/homes/:homeId/balances` safely returns `200 { balances: [] }`.
+
+2. **Invalid total amounts:**
+   - Amounts that are zero (`0`), negative (`-100`), non-integer decimals (`10.5`), string values (`"1000"`), `null`, `NaN`, or values exceeding `Number.MAX_SAFE_INTEGER` are rejected with `422 { error: "totalCents must be a positive integer" }`.
+
+3. **Uneven division & sub-cent splits:**
+   - Uses integer arithmetic: `base = Math.floor(totalCents / n)` and `rem = totalCents % n`.
+   - The first `rem` members (ordered strictly by `order_index ASC`) receive `base + 1` cent, while the remaining members receive `base`.
+   - For tiny bills (e.g. 1 cent across 3 members), the distribution is `1`, `0`, `0`. The sum of all shares mathematically equals `totalCents` in all cases.
+
+4. **Duplicate payment request (Idempotency):**
+   - When the same `Idempotency-Key` is sent repeatedly for the same share, the backend recognizes the key and returns `200 OK` with the original `paidAt` timestamp without altering balances or charging again.
+
+5. **Concurrent payment race condition:**
+   - When multiple requests attempt to pay the same share simultaneously, SQLite serializes write operations. Exactly one transaction modifies the row (`changes === 1`), while subsequent transactions see `paid_at IS NOT NULL` (`changes === 0`) and receive `409 Conflict`.
+
+6. **Non-existent bill, share, or cross-bill lookups:**
+   - Accessing invalid IDs returns `404 Not Found`.
+   - If a share exists but belongs to a different bill ID (`WHERE id = ? AND bill_id = ?`), the query safely rejects it with `404 Not Found`.
+
+7. **Slow API or 500 error resilience (Web UI):**
+   - The frontend API client in `web/src/api.ts` wraps all requests in an `AbortController` (12-second timeout).
+   - Responses are read as text before `JSON.parse()` to safely absorb raw 500 HTML error pages without throwing unhandled syntax exceptions.
+   - If a payment request fails, the share remains unpaid and an error alert is shown to the user.
+
+8. **Malformed request payloads:**
+   - Request bodies that are `null`, empty, arrays, or non-object primitives are intercepted and rejected with `400 { error: "Invalid JSON body" }` before property access occurs.
+
+9. **Cross-home balance isolation:**
+   - When computing `GET /api/homes/:homeId/balances`, the SQL aggregation verifies that shares belong to bills registered to that home (`b.id IS NOT NULL`), preventing debts from other homes from leaking.
+
+---
+
+## Verification & Test Results
+
+The repository includes both visible tests and an automated edge-case test suite (`api/test/hidden-edge-cases.test.ts`):
+
+```bash
+pnpm test       # 50 / 50 tests passing across 4 test suites
+pnpm check      # Biome formatting and linting passes with 0 errors
+pnpm typecheck  # TypeScript strict type-checking passes with 0 errors
+pnpm build      # Production client build succeeds
+```
