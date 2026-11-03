@@ -155,3 +155,22 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Deterministic Member Sequencing via Explicit `order_index`
+
+Part 2 requires splitting bills and allocating remainder cents strictly in the order members were added to a home. Relying on SQLite internal rowids or timestamp precision can produce nondeterminism during rapid sequential writes. We introduced an explicit `order_index INTEGER NOT NULL` populated via `COALESCE(MAX(order_index), 0) + 1` within the home, protected by a `CONSTRAINT uq_members_home_order UNIQUE (home_id, order_index)`. This guarantees 100% stable, deterministic member ordering across all queries and environments.
+
+### 2. Atomic Compare-And-Set for Concurrency & Idempotent Payments
+
+Payment operations must be resilient to duplicate requests with the same `Idempotency-Key` (returning 200 with the exact same payload) and simultaneous payment attempts for the same share (where only one may succeed). Rather than relying on stateful locks (which do not work across distributed, stateless Cloudflare Workers), we implemented an atomic database compare-and-set query:
+`UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`.
+By evaluating `changes === 0`, concurrent race conditions are immediately detected: if the existing record already matches the idempotency key, it replays the original 200 response; otherwise, it returns a 409 Conflict.
+
+### 3. Storage-Level Data Integrity with Named Constraints
+
+To guarantee that invalid states cannot enter the database even outside API validation, we defined explicit named constraints in `api/migrations/0001_init.sql`:
+- `CONSTRAINT check_bills_total_cents CHECK (total_cents > 0)` and `CONSTRAINT check_shares_amount_cents CHECK (amount_cents > 0)` to guarantee positive monetary amounts in whole cents.
+- `CONSTRAINT fk_members_home`, `CONSTRAINT fk_bills_home`, and `CONSTRAINT fk_shares_bill` (with foreign key enforcement and cascade rules) to prevent dangling or orphaned records.
+- `CONSTRAINT uq_shares_idempotency_key UNIQUE (idempotency_key)` to ensure idempotency keys cannot be shared across different share payments.
