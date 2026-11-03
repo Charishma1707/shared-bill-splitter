@@ -8,10 +8,7 @@ export const Route = createFileRoute('/')({
 })
 
 function formatCents(cents: number): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-  }).format(cents / 100)
+  return `${cents}¢`
 }
 
 function formatDate(dateStr: string): string {
@@ -187,7 +184,7 @@ function BillSplitterApp() {
       !Number.isInteger(rawAmount) ||
       rawAmount <= 0
     ) {
-      setBillFormError('Amount must be a positive whole number of cents (e.g. 1000 for $10.00).')
+      setBillFormError('Amount must be a positive whole number of cents (e.g. 1000 or 5001).')
       return
     }
 
@@ -601,7 +598,7 @@ function BillSplitterApp() {
                   </div>
                   <div className="balance-amount owing">
                     {b.outstandingCents === 0 ? (
-                      <span className="balance-amount clear">$0.00 (All settled)</span>
+                      <span className="balance-amount clear">0¢ (All settled)</span>
                     ) : (
                       <span>Owes {formatCents(b.outstandingCents)}</span>
                     )}
@@ -664,7 +661,7 @@ function BillSplitterApp() {
                 min="1"
                 step="1"
                 className="form-input"
-                placeholder="e.g. 1000 ($10.00)"
+                placeholder="e.g. 1000 or 5001"
                 value={billAmountInput}
                 onChange={(e) => setBillAmountInput(e.target.value)}
                 disabled={isCreatingBill || !selectedHomeId}
@@ -701,7 +698,7 @@ function BillSplitterApp() {
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
                 {previewSplit.map((p) => (
                   <span key={p.id} style={{ color: 'var(--text-secondary)' }}>
-                    <strong>{p.name}:</strong> {formatCents(p.cents)} ({p.cents}¢)
+                    <strong>{p.name}:</strong> {formatCents(p.cents)}
                   </span>
                 ))}
               </div>
@@ -788,15 +785,6 @@ function BillSplitterApp() {
                               <td>
                                 <span style={{ fontWeight: 700 }}>
                                   {formatCents(share.amountCents)}
-                                </span>
-                                <span
-                                  style={{
-                                    fontSize: '0.75rem',
-                                    color: 'var(--text-muted)',
-                                    marginLeft: 6,
-                                  }}
-                                >
-                                  ({share.amountCents}¢)
                                 </span>
                               </td>
                               <td>
