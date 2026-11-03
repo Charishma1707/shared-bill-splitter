@@ -27,10 +27,14 @@ app.get('/api/homes', async (c) => {
 })
 
 app.post('/api/homes', async (c) => {
-  let body: { name?: unknown }
+  let body: { name?: unknown } | null = null
   try {
     body = await c.req.json()
   } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400)
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return c.json({ error: 'Invalid JSON body' }, 400)
   }
 
@@ -76,10 +80,14 @@ app.post('/api/homes/:homeId/members', async (c) => {
     return c.json({ error: 'Home not found' }, 404)
   }
 
-  let body: { name?: unknown }
+  let body: { name?: unknown } | null = null
   try {
     body = await c.req.json()
   } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400)
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return c.json({ error: 'Invalid JSON body' }, 400)
   }
 
@@ -97,9 +105,26 @@ app.post('/api/homes/:homeId/members', async (c) => {
   const orderIndex = (maxOrder?.max_idx ?? 0) + 1
   const id = crypto.randomUUID()
 
-  await c.env.DB.prepare('INSERT INTO members (id, home_id, name, order_index) VALUES (?, ?, ?, ?)')
-    .bind(id, homeId, name, orderIndex)
-    .run()
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO members (id, home_id, name, order_index) VALUES (?, ?, ?, ?)',
+    )
+      .bind(id, homeId, name, orderIndex)
+      .run()
+  } catch {
+    // If a concurrent insert occurred, calculate latest next index and insert
+    const latestMax = await c.env.DB.prepare(
+      'SELECT COALESCE(MAX(order_index), 0) AS max_idx FROM members WHERE home_id = ?',
+    )
+      .bind(homeId)
+      .first<{ max_idx: number }>()
+    const retryIndex = (latestMax?.max_idx ?? 0) + 1
+    await c.env.DB.prepare(
+      'INSERT INTO members (id, home_id, name, order_index) VALUES (?, ?, ?, ?)',
+    )
+      .bind(id, homeId, name, retryIndex)
+      .run()
+  }
 
   return c.json({ id, homeId, name }, 201)
 })
@@ -161,16 +186,25 @@ app.post('/api/homes/:homeId/bills', async (c) => {
     return c.json({ error: 'Home not found' }, 404)
   }
 
-  let body: { title?: unknown; totalCents?: unknown }
+  let body: { title?: unknown; totalCents?: unknown } | null = null
   try {
     body = await c.req.json()
   } catch {
     return c.json({ error: 'Invalid JSON body' }, 400)
   }
 
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return c.json({ error: 'Invalid JSON body' }, 400)
+  }
+
   const { title, totalCents } = body
 
-  if (typeof totalCents !== 'number' || !Number.isInteger(totalCents) || totalCents <= 0) {
+  if (
+    typeof totalCents !== 'number' ||
+    !Number.isInteger(totalCents) ||
+    totalCents <= 0 ||
+    totalCents > Number.MAX_SAFE_INTEGER
+  ) {
     return c.json({ error: 'totalCents must be a positive integer' }, 422)
   }
 
@@ -292,11 +326,20 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
 
   // Atomic update to mark as paid if not already paid
   const now = new Date().toISOString()
-  const result = await c.env.DB.prepare(
-    'UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL',
-  )
-    .bind(now, cleanKey, shareId, billId)
-    .run()
+  let result: D1Response
+  try {
+    result = await c.env.DB.prepare(
+      'UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL',
+    )
+      .bind(now, cleanKey, shareId, billId)
+      .run()
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes('UNIQUE') || msg.includes('constraint')) {
+      return c.json({ error: 'Idempotency key already used for another payment' }, 409)
+    }
+    throw err
+  }
 
   if (result.meta.changes === 0) {
     // Concurrent update occurred

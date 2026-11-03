@@ -10,6 +10,11 @@ describe('hidden edge cases & defensive hardening', () => {
       expect(res.status).toBe(400)
     })
 
+    it.each([null, [], 'string body', 123])('rejects non-object body: %j', async (body) => {
+      const res = await call('POST', '/api/homes', { body })
+      expect(res.status).toBe(400)
+    })
+
     it.each(['', '   ', null, 12345])('rejects invalid home name: %j', async (name) => {
       const res = await call('POST', '/api/homes', { body: { name } })
       expect(res.status).toBe(422)
