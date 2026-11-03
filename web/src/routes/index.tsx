@@ -56,9 +56,6 @@ function BillSplitterApp() {
   const [isCreatingBill, setIsCreatingBill] = useState(false)
   const [billFormError, setBillFormError] = useState<string | null>(null)
 
-  // Edge cases helper drawer
-  const [showEdgeCases, setShowEdgeCases] = useState(false)
-
   // Load homes list
   const loadHomes = useCallback(async () => {
     setLoadingHomes(true)
@@ -300,15 +297,6 @@ function BillSplitterApp() {
               ))}
             </select>
           )}
-
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            onClick={() => setShowEdgeCases((prev) => !prev)}
-            title="Toggle Edge Cases Inspection"
-          >
-            🧪 {showEdgeCases ? 'Hide Tests' : 'Edge Cases'}
-          </button>
         </div>
       </header>
 
@@ -349,128 +337,6 @@ function BillSplitterApp() {
           >
             Dismiss
           </button>
-        </div>
-      )}
-
-      {/* Edge Cases Test Helper Panel */}
-      {showEdgeCases && (
-        <div
-          className="card"
-          style={{ marginBottom: 24, border: '1px solid rgba(139, 92, 246, 0.4)' }}
-        >
-          <div className="card-title">
-            <span style={{ color: '#a78bfa' }}>🧪 Handled Edge Cases & Verification</span>
-            <span
-              className="badge"
-              style={{ background: 'rgba(139, 92, 246, 0.2)', color: '#c4b5fd' }}
-            >
-              Spec Verifier
-            </span>
-          </div>
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: 16 }}>
-            Quickly trigger each scenario required by the assignment to observe exact responses and
-            UI resilience:
-          </p>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={async () => {
-                const emptyHome = await api.createHome(
-                  `Empty Home ${Math.floor(Math.random() * 100)}`,
-                )
-                if (emptyHome.ok) {
-                  const billRes = await api.createBill(emptyHome.data.id, 'Test Bill', 1000)
-                  if (!billRes.ok) {
-                    alert(`Case 1 Handled (422): ${billRes.error}`)
-                  }
-                  await loadHomes()
-                }
-              }}
-            >
-              1. Home with no members (422)
-            </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={async () => {
-                if (!selectedHomeId) return alert('Select or create a home first')
-                const billRes = await api.createBill(selectedHomeId, 'Invalid Bill', -50)
-                if (!billRes.ok) {
-                  alert(`Case 2 Handled (422): ${billRes.error}`)
-                }
-              }}
-            >
-              2. Negative/Zero amount (422)
-            </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={() => {
-                setBillTitle('WiFi Bill')
-                setBillAmountInput('1000')
-              }}
-            >
-              3. Uneven Split: 1000 cents (334, 333, 333)
-            </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={async () => {
-                const unpaidShare = bills.flatMap((b) => b.shares).find((s) => !s.paidAt)
-                if (!unpaidShare?.billId) {
-                  return alert('No unpaid shares found in this home to test idempotency')
-                }
-                const key = crypto.randomUUID()
-                const first = await api.payShare(unpaidShare.billId, unpaidShare.id, key)
-                const second = await api.payShare(unpaidShare.billId, unpaidShare.id, key)
-                alert(
-                  `Case 4 Idempotency: Request 1 (${first.status || 200}), Request 2 (${second.status || 200}). PaidAt preserved: ${first.ok && second.ok && first.data.paidAt === second.data.paidAt}`,
-                )
-                if (selectedHomeId) await loadHomeData(selectedHomeId)
-              }}
-            >
-              4. Duplicate Idempotency Key (200)
-            </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={async () => {
-                const unpaidShare = bills.flatMap((b) => b.shares).find((s) => !s.paidAt)
-                if (!unpaidShare?.billId) {
-                  return alert('No unpaid shares found in this home')
-                }
-                const key1 = crypto.randomUUID()
-                const key2 = crypto.randomUUID()
-                const [r1, r2] = await Promise.all([
-                  api.payShare(unpaidShare.billId, unpaidShare.id, key1),
-                  api.payShare(unpaidShare.billId, unpaidShare.id, key2),
-                ])
-                const errMessage = !r1.ok ? r1.error : !r2.ok ? r2.error : 'none'
-                alert(
-                  `Case 5 Concurrent Race: One succeeded (${r1.ok ? 'Req 1' : 'Req 2'}), the other rejected with 409 Conflict: ${errMessage}`,
-                )
-                if (selectedHomeId) await loadHomeData(selectedHomeId)
-              }}
-            >
-              5. Concurrent Double-Pay Race (409)
-            </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={async () => {
-                const res = await api.payShare('non-existent-bill', 'non-existent-share')
-                alert(`Case 6 Handled (404): ${!res.ok ? res.error : 'unexpected'}`)
-              }}
-            >
-              6. Non-existent Bill/Share (404)
-            </button>
-          </div>
         </div>
       )}
 
